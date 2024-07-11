@@ -3,25 +3,42 @@ name: Test Deployment
 on:
   workflow_dispatch:
     inputs:
-      fqdn:
-        description: The FQDN for any attempted calls. Will be added to the hosts file on the runner.
-        required: false
-
       ignore_cache:
         description: Does not restore a package cache if selected.
         required: false
+        type: boolean
+
+      vm_size:
+        description: The size of VM to spin up.
+        default: Standard_B4ms # Standard_B4as_v2
+
+  # Intent: run partial matrix on PR by trusted maintainer
+  # Intent: run full matrix on request
 
 defaults:
   run:
-    shell: powershell
+    shell: pwsh
 
 jobs:
-  runner_test_deploy:
-    name: Test Quickstart Deployment
+  build:
+    name: Build Package Cache
     runs-on: windows-latest
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Create License File
+        run: |
+          if (-not (Test-Path C:\choco-setup\files)) {
+            New-Item -Path C:\choco-setup\files -ItemType Junction -Value $PWD.Path
+          }
+          $LicenseDir = Join-Path $env:ChocolateyInstall 'license'
+          if (-not (Test-Path $LicenseDir)) {$null = mkdir $LicenseDir}
+          Set-Content -Path $LicenseDir\chocolatey.license.xml -Value $(
+            [System.Text.Encoding]::UTF8.GetString(
+              [System.Convert]::FromBase64String('${{ secrets.LICENSE }}')
+            )
+          )
 
       - name: Setup Package Cache
         uses: actions/cache@v4
@@ -33,57 +50,295 @@ jobs:
             !**/chocolatey-license.*.nupkg
           key: "${{ hashFiles('files/*.json') }}"
 
-      - name: Create License File
-        run: |
-          Set-Content -Path .\files\chocolatey.license.xml -Value $(
-            [System.Text.Encoding]::UTF8.GetString(
-              [System.Convert]::FromBase64String('${{ secrets.LICENSE }}')
-            )
-          )
-
       - name: Begin Setup
-        run: |
-          if (-not (Test-Path C:\choco-setup\files)) {
-            New-Item -Path C:\choco-setup\files -ItemType Junction -Value $PWD.Path
-          }
-          if ('${{ inputs.FQDN }}') {
-            Add-Content -Path C:\Windows\system32\drivers\etc\hosts -Value "127.0.0.1  ${{ inputs.FQDN }}"
-          }
-          C:\choco-setup\files\Start-C4bSetup.ps1
+        run: C:\choco-setup\files\OfflineInstallPreparation.ps1
 
-      - name: Setup Nexus
-        run: C:\choco-setup\files\Start-C4BNexusSetup.ps1
-      
-      - name: Setup CCM
-        run: |
-          $DatabaseCredential = [PSCredential]::new(
-            "ccmuser",
-            (ConvertTo-SecureString "$(New-Guid)" -AsPlainText -Force)
-          )
-          C:\choco-setup\files\Start-C4bCcmSetup.ps1 -DatabaseCredential $DatabaseCredential
-      
-      - name: Setup Jenkins
-        run: C:\choco-setup\files\Start-C4bJenkinsSetup.ps1
-      
-      # - name: Setup SSL Security
-      #   run: C:\choco-setup\files\Set-SslSecurity.ps1
+      - name: Upload Built Artifact
+        id: build-upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: choco-packages
+          path: |
+            C:\choco-setup\files\*
+            !C:\choco-setup\files\.git*
+            !chocolatey-license.*.nupkg
+            !C:\choco-setup\files\files\chocolatey.license.xml
+    outputs:
+      artifact-url: ${{ steps.build-upload.outputs.artifact-url }}
 
-      - name: Test the QuickStart Environment
-        run: C:\choco-setup\files\Start-C4bVerification.ps1 -Fqdn $env:ComputerName
+  runner_test_deploy:
+    strategy:
+      matrix:
+        os: ["Win2022AzureEditionCore", "Win2019Datacenter"]
+        variant: ["selfsigned"] # "certificate", "wildcard"]
+    name: Test Quickstart Deployment on ${{ matrix.os }}
+    runs-on: windows-latest
+    needs: build
+    if: success()
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true
+
+      - name: Deploy '${{ matrix.os }}' VM
+        uses: azure/powershell@v2
+        with:
+          inlineScript: |
+            $Location = 'eastus2'
+            $ResourceGroupName = "qsg-testing"
+            if ('${{ github.run_id }}' -ne "`$`{{ github.run_id }}") {$ResourceGroupName += '-${{ github.run_id }}'}
+            # $VmName = -join "qsg-$('${{ matrix.os }}' -replace '^windowsserver')-$('${{ matrix.variant }}')"[0..14]
+            $VmName = "qsg-$((New-Guid).ToString() -replace '-')" -replace '^(.{15}).+$','$1'
+            if (-not (Get-AzResourceGroup -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
+              $null = New-AzResourceGroup -ResourceGroupName $ResourceGroupName -Location $Location
+            }
+            # Create Security Group allowing connections from $CurrentIP
+            if (-not (Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -ErrorAction SilentlyContinue)) {
+              $VmArgs = @{
+                ResourceGroup = $ResourceGroupName
+                Name = $VmName
+                PublicIpAddressName = "$VmName-ip"
+                DomainNameLabel = $VmName
+                PublicIpSku = 'Basic'
+                Image = '${{ matrix.os }}'
+                Size = '${{ inputs.vm_size }}'
+                SecurityGroupName = "$ResourceGroupName-nsg"
+                VirtualNetworkName = "$ResourceGroupName-vnet"
+                NetworkInterfaceDeleteOption = 'Delete'
+                OSDiskDeleteOption = 'Delete'
+                Credential = [PSCredential]::new(
+                  'ccmadmin',
+                  (ConvertTo-SecureString "$(New-Guid)" -AsPlainText -Force)
+                )
+              }
+
+              Write-Host "Creating VM '$($VmArgs.Name)'"
+              $VM = New-AzVM @VmArgs
+
+              # Output useful bits, e.g. cred, to job output, respecting matrix
+            }
+
+            # Set NSG to have access
+            if ($NetworkSecurityGroup = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $ResourceGroupName-nsg -ErrorAction SilentlyContinue) {
+              $IpAddress = irm https://api.ipify.org
+              $RuleArgs = @{
+                NetworkSecurityGroup = $NetworkSecurityGroup
+                Name = "AllowWinRMSecure$($IpAddress -replace '\.')"
+                Description = "Allow WinRM over HTTPS"
+                Access = "Allow"
+                Protocol = "Tcp"
+                Direction = "Inbound"
+                Priority = 300
+                SourceAddressPrefix = $IpAddress
+                SourcePortRange = "*"
+                DestinationAddressPrefix = "*"
+                DestinationPortRange = 5986
+              }
+              if ((Get-AzNetworkSecurityRuleConfig -NetworkSecurityGroup $NetworkSecurityGroup).Name -notcontains $RuleArgs.Name) {
+                Write-Host "Adding WinRM Rule to '$($NetworkSecurityGroup.Name)'"
+                $NewRules = Add-AzNetworkSecurityRuleConfig @RuleArgs
+              }
+              if ($NewRules) {
+                $null = Set-AzNetworkSecurityGroup -NetworkSecurityGroup $NetworkSecurityGroup
+              }
+            }
+
+            Write-Host "Enabling Remote PowerShell on '$($VmArgs.Name)'"
+            $null = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -Name $VmArgs.Name -CommandId EnableRemotePS
+
+            Write-Host "Creating remoting session for $($VmArgs.Credential.UserName)@$($Vm.FullyQualifiedDomainName)"
+            $RemotingArgs = @{
+              ComputerName = $Vm.FullyQualifiedDomainName
+              Credential = $VmArgs.Credential
+              UseSSL = $true
+              SessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck
+            }
+            $Session = New-PSSession @RemotingArgs
+
+            # This throws an error when the session terminates, so we catch the PSRemotingTransportException 
+            try {
+              Invoke-Command -Session $Session {
+                Register-PSSessionConfiguration -Name "Hopless" -RunAsCredential $using:VmArgs.Credential -Force
+              } -ErrorAction Stop
+            } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {}
+
+            Write-Verbose "Recreating Session after WinRM restart..."
+            $Timeout = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($Session.Availability -ne 'Available' -and $Timeout.Elapsed.TotalSeconds -lt 60) {
+              try {
+                $Session = New-PSSession @RemotingArgs -ConfigurationName 'Hopless'
+              } catch {
+                Start-Sleep -Seconds 5
+              }
+            }
+
+            if ($Session.Availability -ne 'Available') {
+              Write-Error "Failed to re-establish a connection to '$($Vm.FullyQualifiedDomainName)'"
+            }
+
+            try {
+              $DownloadUrl = if ('${{ needs.build.outputs.artifact-url }}' -match 'https://github.com/(?<Owner>.+)/(?<Repository>.+)/actions/runs/(?<RunId>\d+)/artifacts/(?<ArtifactId>\d+)') {
+                "https://api.github.com/repos/$($Matches.Owner)/$($Matches.Repository)/actions/artifacts/$($Matches.ArtifactId)/zip"
+              } else {
+                '${{ needs.build.outputs.artifact-url }}'
+              }
+              Write-Host "Downloading Build Artifact '$DownloadUrl' to '$($VmArgs.Name)' @$(Get-Date -Format o)"
+              Invoke-Command -Session $Session -ScriptBlock {
+                if (-not (Test-Path C:\choco-setup\files)) {$null = mkdir C:\choco-setup\files -Force}
+                $ProgressPreference = "SilentlyContinue"
+                $Response = Invoke-WebRequest -Uri $using:DownloadUrl -UseBasicParsing -Headers @{
+                  Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+                  Accept = "application/vnd.github+json"
+                  "X-GitHub-Api-Version" = "2022-11-28"
+                } -OutFile C:\choco-setup\files.zip
+                Expand-Archive -Path C:\choco-setup\files.zip -DestinationPath C:\choco-setup\files\
+              }
+            } finally {
+              Write-Host "Finished Downloading @$(Get-Date -Format o)"
+            }
+
+            Write-Host "Creating License File on '$($VmArgs.Name)'"
+            Invoke-Command -Session $Session -ScriptBlock {
+              Set-Content -Path C:\choco-setup\files\files\chocolatey.license.xml -Value $(
+                [System.Text.Encoding]::UTF8.GetString(
+                  [System.Convert]::FromBase64String('${{ secrets.LICENSE }}')
+                )
+              )
+            }
+
+            Write-Host "Setting up '${{ matrix.variant }}' Certificate"
+            $Certificate = switch ('${{ matrix.variant }}') {
+              'selfsigned' {
+                Write-Host "Creating a Self-Signed Certificate for '$($Vm.FullyQualifiedDomainName)'"
+                @{Hostname = $Vm.FullyQualifiedDomainName}
+              }
+              'certificate' {
+                $Thumbprint = Invoke-Command -Session $Session -ScriptBlock {
+                  $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                    [Convert]::FromBase64String('${{ secrets.SINGLE_CERT }}'),
+                    (ConvertTo-SecureString '${{ secrets.SINGLE_PASS }}' -AsPlainText -Force)
+                  )
+
+                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("My", "LocalMachine")
+                  $Store.Open("ReadWrite")
+                  $Store.Add($Cert)
+
+                  $Cert.Thumbprint
+                }
+                Write-Host "Using Certificate with Thumbprint '$($Thumbprint)'"
+                @{Thumbprint = $Thumbprint; Hardened = $true}
+              }
+              'wildcard' {
+                $Thumbprint = Invoke-Command -Session $Session -ScriptBlock {
+                  $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                    [Convert]::FromBase64String('${{ secrets.WILDCARD_CERT }}'),
+                    (ConvertTo-SecureString '${{ secrets.WILDCARD_PASS }}' -AsPlainText -Force)
+                  )
+
+                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("My", "LocalMachine")
+                  $Store.Open("ReadWrite")
+                  $Store.Add($Cert)
+
+                  $Cert.Thumbprint
+                }
+                Write-Host "Using Wildcard with Thumbprint '$($Thumbprint)'"
+                @{Thumbprint = $Thumbprint; CertificateDnsName = $Vm.FullyQualifiedDomainName; Hardened = $true}
+              }
+            }
+
+            try {
+              Write-Host "Installing QuickStart Guide on '$($VmArgs.Name)'"
+              $DatabaseCredential = [PSCredential]::new(
+                'ccmdbuser',
+                (ConvertTo-SecureString "$(New-Guid)" -AsPlainText -Force)
+              )
+              Invoke-Command -Session $Session -ScriptBlock {
+                C:\choco-setup\files\Start-C4bSetup.ps1
+                C:\choco-setup\files\Start-C4BNexusSetup.ps1
+                C:\choco-setup\files\Start-C4bCcmSetup.ps1 -DatabaseCredential $using:DatabaseCredential
+                C:\choco-setup\files\Start-C4bJenkinsSetup.ps1
+                C:\choco-setup\files\Set-SslSecurity.ps1 @using:Certificate
+              }
+
+              # Run Tests
+              Write-Host "Running Verification Tests on '$($VmArgs.Name)'"
+              $TestResults = Invoke-Command -Session $Session -ScriptBlock {
+                if (-not (Get-Module Pester -ListAvailable).Where{$_.Version -gt "5.0"}) {
+                  Write-Host "Installing Pester 5 to run validation tests"
+                  $chocoArgs = @('install', 'pester', '-y', '--source="https://community.chocolatey.org/api/v2/"')
+                  & choco @chocoArgs | Write-Host
+                }
+                (Get-ChildItem C:\choco-setup\files\tests\ -Recurse -Filter *.tests.ps1).Fullname
+              } | ForEach-Object {
+                Invoke-Command @RemotingArgs -ScriptBlock {
+                  param(
+                    $Path
+                  )
+                  . C:\choco-setup\files\scripts\Get-Helpers.ps1
+                  $configuration = New-PesterConfiguration @{
+                    Run        = @{
+                      Container = New-PesterContainer -Path $Path -Data @{ Fqdn = $env:ComputerName }
+                      Passthru  = $true
+                    }
+                    Output     = @{
+                      Verbosity = 'Detailed'
+                    }
+                    TestResult = @{
+                      Enabled      = $true
+                      OutputFormat = 'NUnitXml'
+                      OutputPath   = "C:\choco-setup\test-results\$((Split-Path $Path -Leaf) -replace '.tests.ps1$')-verification.results.xml"
+                    }
+                  }
+
+                  Invoke-Pester -Configuration $configuration
+                } -ArgumentList $_
+              }
+            } finally {
+              Write-Host "Copying Results from '$($VmArgs.Name)' @$(Get-Date -Format o)"
+              if (-not (Test-Path .\logs\ -PathType Container)) {$null = mkdir .\logs\}
+              Copy-Item -FromSession $Session -Path C:\choco-setup\logs\* -Destination .\logs\ -ErrorAction SilentlyContinue
+              Copy-Item -FromSession $Session -Path C:\choco-setup\test-results\*-verification.results.xml -Destination .\logs\ -ErrorAction SilentlyContinue
+            }
+          azPSVersion: latest
 
       - name: Publish Test Results
-        uses: dorny/test-reporter@v1.9.1
+        uses: zyborg/pester-tests-report@v1
         if: success() || failure()
         with:
-          name: C4bVerification
-          path: C:\choco-setup\test-results\verification.results.xml
-          reporter: dotnet-nunit
-          # fail-on-error: true
-          # fail-on-empty: true
+          test_results_path: logs\*-verification.results.xml
+          report_name: C4bVerification-${{ matrix.os }}-${{ matrix.variant }}
 
       - name: Publish Log Files
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success() || failure()
         with:
-          name: choco-setup-logs
-          path: C:\choco-setup\logs\
+          name: choco-setup-logs-${{ matrix.os }}-${{ matrix.variant }}
+          path: logs\*.txt
+
+  cleanup:
+    name: Cleanup Test Resources
+    runs-on: ubuntu-latest
+    needs: runner_test_deploy
+    if: success() || failure()
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true
+
+      - name: Destroy Remaining Resources
+        uses: azure/powershell@v2
+        with:
+          inlineScript: |
+            $ResourceGroupName = "qsg-testing"
+            if ('${{ github.run_id }}' -ne "`$`{{ github.run_id }}") {$ResourceGroupName += '-${{ github.run_id }}'}
+            if (Get-AzResourceGroup -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue) {
+              Remove-AzResourceGroup -ResourceGroupName $ResourceGroupName -Force  # -AsJob
+            }
+          azPSVersion: latest
