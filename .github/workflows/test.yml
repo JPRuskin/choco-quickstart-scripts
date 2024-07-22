@@ -12,14 +12,78 @@ on:
         description: The size of VM to spin up.
         default: Standard_B4ms # Standard_B4as_v2
 
-  # Intent: run partial matrix on PR by trusted maintainer
-  # Intent: run full matrix on request
+  pull_request:
+    paths:
+      - files/**.json
+      - '*.ps1'
+      - scripts/**.ps1
+    types:
+      ready_for_review
+
+  pull_request_review:
+    types:
+      - submitted
+
+# May want to remove this, as though it's neat to only have one job running per 
+# ref, it may cancel before cleanup has happened.
+# concurrency:
+#   group: ${{ github.workflow }}-${{ github.ref }}
+#  cancel-in-progress: true
 
 defaults:
   run:
     shell: pwsh
 
 jobs:
+  matrix:
+    name: Generate Testing Parameters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Test Matrix
+        id: test-matrix
+        shell: pwsh
+        run: |
+          $EventType = '${{ github.event_name }}'
+          $AuthHeaders = @{Headers = @{Authorization = 'Bearer ${{ secrets.GITHUB_TOKEN }}'}}
+          $GitHubApi = '${{ github.api_url }}'
+          switch ($EventType) {
+            'workflow_dispatch' {
+              # We have been triggered manually. Run it all!
+              $Images = "Win2022AzureEditionCore", "Win2019Datacenter"
+              $Variants = "selfsigned", "single", "wildcard"
+            }
+            'pull_request' {
+              # This is a pull request. If it's from a known maintainer, run a fast test - otherwise, exit.
+              $TriggerPermission = Invoke-RestMethod "$GitHubApi/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" @AuthHeaders
+
+              if ($TriggerPermission -in @("admin", "write")) {
+                $Images = "Win2022AzureEditionCore"
+                $Variants = "selfsigned"
+              } else {
+                Write-Error "Action was triggered by '${{ github.actor }}', who has '$TriggerPermission': Cancelling build."
+                exit 1
+              }
+            }
+            'pull_request_review' {
+              # This is a review. If it's positive, run tests - otherwise, exit.
+              $TriggerPermission = Invoke-RestMethod "$GitHubApi/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" @AuthHeaders
+
+              if ($TriggerPermission -in @("admin", "write")) {
+                $Images = "Win2022AzureEditionCore", "Win2019Datacenter"
+                $Variants = "selfsigned", "single", "wildcard"
+              } else {
+               Write-Error "Action was triggered by '${{ github.actor }}', who has '$TriggerPermission': Cancelling build."
+                exit 1
+              }
+            }
+          }
+          "images=$($Images | ConvertTo-Json -Compress -AsArray)" >> $env:GITHUB_OUTPUT
+          "variants=$($Variants | ConvertTo-Json -Compress -AsArray)" >> $env:GITHUB_OUTPUT
+
+    outputs:
+      matrix-os: ${{ steps.test-matrix.outputs.images }}
+      matrix-variant: ${{ steps.test-matrix.outputs.variants }}
+
   build:
     name: Build Package Cache
     runs-on: windows-latest
@@ -63,17 +127,19 @@ jobs:
             !C:\choco-setup\files\.git*
             !chocolatey-license.*.nupkg
             !C:\choco-setup\files\files\chocolatey.license.xml
+
     outputs:
       artifact-url: ${{ steps.build-upload.outputs.artifact-url }}
 
   runner_test_deploy:
     strategy:
       matrix:
-        os: ["Win2022AzureEditionCore", "Win2019Datacenter"]
-        variant: ["selfsigned"] # "certificate", "wildcard"]
-    name: Test Quickstart Deployment on ${{ matrix.os }}
+        os: ${{ fromJson(needs.matrix.outputs.matrix-os) }}
+        variant: ${{ fromJson(needs.matrix.outputs.matrix-variant) }}
+      fail-fast: false
+    name: Test ${{ matrix.os }} with ${{ matrix.variant }}
     runs-on: windows-latest
-    needs: build
+    needs: [build, matrix]
     if: success()
     steps:
       - name: Check out code
@@ -86,75 +152,29 @@ jobs:
           enable-AzPSSession: true
 
       - name: Deploy '${{ matrix.os }}' VM
+        id: deploy-vm
         uses: azure/powershell@v2
         with:
           inlineScript: |
+            Import-Module .\.github\workflows\Helpers.psm1
+
             $Location = 'eastus2'
             $ResourceGroupName = "qsg-testing"
             if ('${{ github.run_id }}' -ne "`$`{{ github.run_id }}") {$ResourceGroupName += '-${{ github.run_id }}'}
-            # $VmName = -join "qsg-$('${{ matrix.os }}' -replace '^windowsserver')-$('${{ matrix.variant }}')"[0..14]
-            $VmName = "qsg-$((New-Guid).ToString() -replace '-')" -replace '^(.{15}).+$','$1'
+
             if (-not (Get-AzResourceGroup -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
-              $null = New-AzResourceGroup -ResourceGroupName $ResourceGroupName -Location $Location
+              $null = New-AzResourceGroup -ResourceGroupName $ResourceGroupName -Location $Location -Force
             }
-            # Create Security Group allowing connections from $CurrentIP
-            if (-not (Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -ErrorAction SilentlyContinue)) {
-              $VmArgs = @{
-                ResourceGroup = $ResourceGroupName
-                Name = $VmName
-                PublicIpAddressName = "$VmName-ip"
-                DomainNameLabel = $VmName
-                PublicIpSku = 'Basic'
-                Image = '${{ matrix.os }}'
-                Size = '${{ inputs.vm_size }}'
-                SecurityGroupName = "$ResourceGroupName-nsg"
-                VirtualNetworkName = "$ResourceGroupName-vnet"
-                NetworkInterfaceDeleteOption = 'Delete'
-                OSDiskDeleteOption = 'Delete'
-                Credential = [PSCredential]::new(
-                  'ccmadmin',
-                  (ConvertTo-SecureString "$(New-Guid)" -AsPlainText -Force)
-                )
-              }
 
-              Write-Host "Creating VM '$($VmArgs.Name)'"
-              $VM = New-AzVM @VmArgs
-
-              # Output useful bits, e.g. cred, to job output, respecting matrix
-            }
+            $VM = New-TestVM -ResourceGroupName $ResourceGroupName -Image '${{ matrix.os }}' -Size '${{ inputs.vm_size }}'
 
             # Set NSG to have access
-            if ($NetworkSecurityGroup = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $ResourceGroupName-nsg -ErrorAction SilentlyContinue) {
-              $IpAddress = irm https://api.ipify.org
-              $RuleArgs = @{
-                NetworkSecurityGroup = $NetworkSecurityGroup
-                Name = "AllowWinRMSecure$($IpAddress -replace '\.')"
-                Description = "Allow WinRM over HTTPS"
-                Access = "Allow"
-                Protocol = "Tcp"
-                Direction = "Inbound"
-                Priority = 300
-                SourceAddressPrefix = $IpAddress
-                SourcePortRange = "*"
-                DestinationAddressPrefix = "*"
-                DestinationPortRange = 5986
-              }
-              if ((Get-AzNetworkSecurityRuleConfig -NetworkSecurityGroup $NetworkSecurityGroup).Name -notcontains $RuleArgs.Name) {
-                Write-Host "Adding WinRM Rule to '$($NetworkSecurityGroup.Name)'"
-                $NewRules = Add-AzNetworkSecurityRuleConfig @RuleArgs
-              }
-              if ($NewRules) {
-                $null = Set-AzNetworkSecurityGroup -NetworkSecurityGroup $NetworkSecurityGroup
-              }
-            }
+            Request-WinRmAccessForTesting -ResourceGroupName $ResourceGroupName -VmName $VM.Name
 
-            Write-Host "Enabling Remote PowerShell on '$($VmArgs.Name)'"
-            $null = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -Name $VmArgs.Name -CommandId EnableRemotePS
-
-            Write-Host "Creating remoting session for $($VmArgs.Credential.UserName)@$($Vm.FullyQualifiedDomainName)"
+            Write-Host "Creating remoting session for $($VM.Credential.UserName)@$($Vm.FullyQualifiedDomainName)"
             $RemotingArgs = @{
-              ComputerName = $Vm.FullyQualifiedDomainName
-              Credential = $VmArgs.Credential
+              ComputerName = $VM.FullyQualifiedDomainName
+              Credential = $VM.Credential
               UseSSL = $true
               SessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck
             }
@@ -162,14 +182,16 @@ jobs:
 
             # This throws an error when the session terminates, so we catch the PSRemotingTransportException 
             try {
-              Invoke-Command -Session $Session {
-                Register-PSSessionConfiguration -Name "Hopless" -RunAsCredential $using:VmArgs.Credential -Force
+              $HoplessSession = Invoke-Command -Session $Session {
+                Register-PSSessionConfiguration -Name "Hopless" -RunAsCredential $using:VM.Credential -Force
               } -ErrorAction Stop
             } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {}
 
+            Start-Sleep -Seconds 30  # Hate this, but just testing the idea out.
+
             Write-Verbose "Recreating Session after WinRM restart..."
             $Timeout = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($Session.Availability -ne 'Available' -and $Timeout.Elapsed.TotalSeconds -lt 60) {
+            while ($Session.Availability -ne 'Available' -and $Timeout.Elapsed.TotalSeconds -lt 180) {
               try {
                 $Session = New-PSSession @RemotingArgs -ConfigurationName 'Hopless'
               } catch {
@@ -178,7 +200,51 @@ jobs:
             }
 
             if ($Session.Availability -ne 'Available') {
+              $Session
               Write-Error "Failed to re-establish a connection to '$($Vm.FullyQualifiedDomainName)'"
+            } else {
+              Write-Host "Successfully reconnected after '$($Timeout.Elapsed.TotalSeconds)' seconds" 
+            }
+
+            # Install Dotnet 4.8 if required
+            $RequiresDotnet = Invoke-Command -Session $Session -ScriptBlock {
+              (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Release -lt 528040
+            }
+
+            if ($RequiresDotnet) {
+              Write-Host "Installing Dotnet 4.8 to '$($Vm.FullyQualifiedDomainName)'"
+              $DotnetInstall = Invoke-Command -Session $Session -ScriptBlock {
+                $NetFx48Url = 'https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-x86-x64-allos-enu.exe'
+                $NetFx48Path = $env:TEMP
+                $NetFx48InstallerFile = 'ndp48-x86-x64-allos-enu.exe'
+                $NetFx48Installer = Join-Path $NetFx48Path $NetFx48InstallerFile
+                if (!(Test-Path $NetFx48Installer)) {
+                  Write-Host "Downloading `'$NetFx48Url`' to `'$NetFx48Installer`'"
+                  (New-Object Net.WebClient).DownloadFile("$NetFx48Url","$NetFx48Installer")
+                }
+
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.WorkingDirectory = "$NetFx48Path"
+                $psi.FileName = "$NetFx48InstallerFile"
+                $psi.Arguments = "/q /norestart"
+
+                Write-Host "Installing `'$NetFx48Installer`'"
+                $s = [System.Diagnostics.Process]::Start($psi);
+                $s.WaitForExit();
+
+                return $s.ExitCode
+              }
+
+              if ($DotnetInstall -eq 1641 -or $DotnetInstall -eq 3010) {
+                Write-Host ".NET Framework 4.8 was installed, but a reboot is required before using Chocolatey CLI."
+                $Reboot = Restart-AzVm -ResourceGroupName $ResourceGroupName -Name $VM.Name
+                if ($Reboot.Status -eq 'Succeeded') {
+                  Write-Host "Reboot was successful after $($Reboot.Endtime - $Reboot.Starttime)"
+                }
+
+                # Recreate the session
+                $Session = New-PSSession @RemotingArgs -ConfigurationName 'Hopless'
+              }
             }
 
             try {
@@ -187,7 +253,7 @@ jobs:
               } else {
                 '${{ needs.build.outputs.artifact-url }}'
               }
-              Write-Host "Downloading Build Artifact '$DownloadUrl' to '$($VmArgs.Name)' @$(Get-Date -Format o)"
+              Write-Host "Downloading Build Artifact '$DownloadUrl' to '$($VM.Name)' @$(Get-Date -Format o)"
               Invoke-Command -Session $Session -ScriptBlock {
                 if (-not (Test-Path C:\choco-setup\files)) {$null = mkdir C:\choco-setup\files -Force}
                 $ProgressPreference = "SilentlyContinue"
@@ -202,7 +268,7 @@ jobs:
               Write-Host "Finished Downloading @$(Get-Date -Format o)"
             }
 
-            Write-Host "Creating License File on '$($VmArgs.Name)'"
+            Write-Host "Creating License File on '$($VM.Name)'"
             Invoke-Command -Session $Session -ScriptBlock {
               Set-Content -Path C:\choco-setup\files\files\chocolatey.license.xml -Value $(
                 [System.Text.Encoding]::UTF8.GetString(
@@ -217,7 +283,7 @@ jobs:
                 Write-Host "Creating a Self-Signed Certificate for '$($Vm.FullyQualifiedDomainName)'"
                 @{Hostname = $Vm.FullyQualifiedDomainName}
               }
-              'certificate' {
+              'single' {
                 $Thumbprint = Invoke-Command -Session $Session -ScriptBlock {
                   $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
                     [Convert]::FromBase64String('${{ secrets.SINGLE_CERT }}'),
@@ -252,11 +318,12 @@ jobs:
             }
 
             try {
-              Write-Host "Installing QuickStart Guide on '$($VmArgs.Name)'"
+              Write-Host "Installing QuickStart Guide on '$($VM.Name)'"
               $DatabaseCredential = [PSCredential]::new(
                 'ccmdbuser',
                 (ConvertTo-SecureString "$(New-Guid)" -AsPlainText -Force)
               )
+              $Timer = [System.Diagnostics.Stopwatch]::StartNew()
               Invoke-Command -Session $Session -ScriptBlock {
                 C:\choco-setup\files\Start-C4bSetup.ps1
                 C:\choco-setup\files\Start-C4BNexusSetup.ps1
@@ -264,9 +331,11 @@ jobs:
                 C:\choco-setup\files\Start-C4bJenkinsSetup.ps1
                 C:\choco-setup\files\Set-SslSecurity.ps1 @using:Certificate
               }
+              $Timer.Stop()
+              "deployment-time=$($Timer.Elapsed)" >> $env:GITHUB_OUTPUT
 
               # Run Tests
-              Write-Host "Running Verification Tests on '$($VmArgs.Name)'"
+              Write-Host "Running Verification Tests on '$($VM.Name)'"
               $TestResults = Invoke-Command -Session $Session -ScriptBlock {
                 if (-not (Get-Module Pester -ListAvailable).Where{$_.Version -gt "5.0"}) {
                   Write-Host "Installing Pester 5 to run validation tests"
@@ -299,19 +368,21 @@ jobs:
                 } -ArgumentList $_
               }
             } finally {
-              Write-Host "Copying Results from '$($VmArgs.Name)' @$(Get-Date -Format o)"
+              Write-Host "Copying Results from '$($VM.Name)' @$(Get-Date -Format o)"
               if (-not (Test-Path .\logs\ -PathType Container)) {$null = mkdir .\logs\}
               Copy-Item -FromSession $Session -Path C:\choco-setup\logs\* -Destination .\logs\ -ErrorAction SilentlyContinue
-              Copy-Item -FromSession $Session -Path C:\choco-setup\test-results\*-verification.results.xml -Destination .\logs\ -ErrorAction SilentlyContinue
+              Copy-Item -FromSession $Session -Path C:\choco-setup\test-results\* -Destination .\logs\ -ErrorAction SilentlyContinue
             }
           azPSVersion: latest
 
       - name: Publish Test Results
-        uses: zyborg/pester-tests-report@v1
-        if: success() || failure()
+        uses: EnricoMi/publish-unit-test-result-action/windows@v2
+        if: success()
         with:
-          test_results_path: logs\*-verification.results.xml
-          report_name: C4bVerification-${{ matrix.os }}-${{ matrix.variant }}
+          check_name: C4bVerification-${{ matrix.os }}-${{ matrix.variant }}
+          files: |
+            logs\*-verification.results.xml
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish Log Files
         uses: actions/upload-artifact@v4
