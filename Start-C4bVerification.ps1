@@ -10,7 +10,7 @@ process {
     $HelperPath  = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) -ChildPath 'scripts'
     $Helpers = Join-Path $HelperPath -ChildPath 'Get-Helpers.ps1'
     . $Helpers
-
+# Test!
     if (-not (Get-Module Pester -ListAvailable).Where{$_.Version -gt "5.0"}) {
         Write-Host "Installing Pester 5 to run validation tests"
         $chocoArgs = @('install', 'pester', '-y', '--no-progress', '--source="https://community.chocolatey.org/api/v2/"')
