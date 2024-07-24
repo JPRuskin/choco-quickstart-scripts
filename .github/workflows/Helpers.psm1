@@ -89,3 +89,107 @@ function Request-WinRmAccessForTesting {
         $null = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroupName -Name $VMName -CommandId EnableRemotePS
     }
 }
+
+function New-HoplessRemotingSession {
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Runspaces.PSSession])]
+    param(
+        # The address to connect to
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+        
+        # The credential for the session
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
+    )
+    Write-Host "Creating remoting session for $($Credential.UserName)@$($ComputerName)"
+    $RemotingArgs = @{
+        ComputerName = $ComputerName
+        Credential = $Credential
+        UseSSL = $true
+        SessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck
+    }
+    try {
+        $Session = New-PSSession @RemotingArgs -ConfigurationName Hopless -ErrorAction Stop
+    } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+        if ($_.Exception.Message -match 'Cannot find the Hopless session configuration') {
+            Write-Host "Creating Hopless Configuration for $($Credential.UserName)@$($ComputerName)"
+            # This throws an error when the session terminates, so we catch the PSRemotingTransportException 
+            try {
+                $null = Invoke-Command @RemotingArgs {
+                    Register-PSSessionConfiguration -Name "Hopless" -RunAsCredential $using:Credential -Force -WarningAction SilentlyContinue
+                } -ErrorAction Stop
+            } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {}
+        
+            Start-Sleep -Seconds 30  # Hate this, but just testing the idea out.
+        
+            Write-Verbose "Recreating Session after WinRM restart..."
+            $Timeout = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($Session.Availability -ne 'Available' -and $Timeout.Elapsed.TotalSeconds -lt 180) {
+                try {
+                    $Session = New-PSSession @RemotingArgs -ConfigurationName Hopless
+                } catch {
+                    Start-Sleep -Seconds 5
+                }
+            }
+
+            if ($Session.Availability -ne 'Available') {
+                $Session
+                Write-Error "Failed to re-establish a connection to '$($ComputerName)'"
+            } else {
+                Write-Host "Successfully reconnected after '$($Timeout.Elapsed.TotalSeconds)' seconds" 
+            }
+        } else {throw}
+    }
+    return $Session
+}
+
+function Install-DotNet {
+    [OutputType([int32])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Separate')]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory, ParameterSetName = 'Separate')]
+        [PSCredential]$Credential,
+
+        [Parameter(Mandatory, ParameterSetName = 'Session')]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [string]$DownloadPath = 'https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-x86-x64-allos-enu.exe'
+    )
+    # Install Dotnet 4.8 if required
+    $RequiresDotnet = Invoke-Command -Session $Session -ScriptBlock {
+        (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Release -lt 528040
+    }
+
+    if ($RequiresDotnet) {
+        Write-Host "Installing Dotnet 4.8 to '$($Vm.FullyQualifiedDomainName)'"
+        $DotnetInstall = Invoke-Command -Session $Session -ScriptBlock {
+            $NetFx48Url = $using:DownloadPath
+            $NetFx48Path = $env:TEMP
+            $NetFx48InstallerFile = 'ndp48-x86-x64-allos-enu.exe'
+            $NetFx48Installer = Join-Path $NetFx48Path $NetFx48InstallerFile
+            if (!(Test-Path $NetFx48Installer)) {
+                Write-Host "Downloading `'$NetFx48Url`' to `'$NetFx48Installer`'"
+                (New-Object Net.WebClient).DownloadFile("$NetFx48Url","$NetFx48Installer")
+            }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.WorkingDirectory = "$NetFx48Path"
+            $psi.FileName = "$NetFx48InstallerFile"
+            $psi.Arguments = "/q /norestart"
+
+            Write-Host "Installing `'$NetFx48Installer`'"
+            $s = [System.Diagnostics.Process]::Start($psi);
+            $s.WaitForExit();
+
+            return $s.ExitCode
+        }
+
+        return $DotnetInstall
+    } else {
+        return 0  # No work performed / success
+    }
+}

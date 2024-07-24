@@ -12,17 +12,25 @@ on:
         description: The size of VM to spin up.
         default: Standard_B4ms # Standard_B4as_v2
 
+      images:
+        description: The Azure images to test on.
+        default: Win2022AzureEditionCore, Win2019Datacenter
+        type: string
+
+      variants:
+        description: The configurations to test with.
+        default: self-signed, single, wildcard
+
   pull_request:
     paths:
       - files/**.json
-      - '*.ps1'
+      - "**.ps1"
       - scripts/**.ps1
     types:
-      ready_for_review
-
-  pull_request_review:
-    types:
-      - submitted
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
 # May want to remove this, as though it's neat to only have one job running per 
 # ref, it may cancel before cleanup has happened.
@@ -48,31 +56,19 @@ jobs:
           $GitHubApi = '${{ github.api_url }}'
           switch ($EventType) {
             'workflow_dispatch' {
-              # We have been triggered manually. Run it all!
-              $Images = "Win2022AzureEditionCore", "Win2019Datacenter"
-              $Variants = "selfsigned", "single", "wildcard"
+              # We have been triggered manually. Run the inputs!
+              $Images = (-split '${{ inputs.images }}').Trim(',;')
+              $Variants = (-split '${{ inputs.variants }}').Trim(',;')
             }
             'pull_request' {
-              # This is a pull request. If it's from a known maintainer, run a fast test - otherwise, exit.
-              $TriggerPermission = Invoke-RestMethod "$GitHubApi/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" @AuthHeaders
+              # This is a pull request. If it's from a known maintainer, run a test - otherwise, exit.
+              $Trigger = Invoke-RestMethod "$GitHubApi/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" @AuthHeaders
 
-              if ($TriggerPermission -in @("admin", "write")) {
-                $Images = "Win2022AzureEditionCore"
-                $Variants = "selfsigned"
+              if ($Trigger.Permission -in @("admin", "write")) {
+                $Images = "Win2022AzureEditionCore", "Win2019Datacenter"
+                $Variants = "self-signed", "single", "wildcard"
               } else {
                 Write-Error "Action was triggered by '${{ github.actor }}', who has '$TriggerPermission': Cancelling build."
-                exit 1
-              }
-            }
-            'pull_request_review' {
-              # This is a review. If it's positive, run tests - otherwise, exit.
-              $TriggerPermission = Invoke-RestMethod "$GitHubApi/repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" @AuthHeaders
-
-              if ($TriggerPermission -in @("admin", "write")) {
-                $Images = "Win2022AzureEditionCore", "Win2019Datacenter"
-                $Variants = "selfsigned", "single", "wildcard"
-              } else {
-               Write-Error "Action was triggered by '${{ github.actor }}', who has '$TriggerPermission': Cancelling build."
                 exit 1
               }
             }
@@ -86,6 +82,7 @@ jobs:
 
   build:
     name: Build Package Cache
+    # needs: matrix  # If we want to block this from running until after the ~7s matrix job...
     runs-on: windows-latest
     steps:
       - name: Check out code
@@ -137,7 +134,7 @@ jobs:
         os: ${{ fromJson(needs.matrix.outputs.matrix-os) }}
         variant: ${{ fromJson(needs.matrix.outputs.matrix-variant) }}
       fail-fast: false
-    name: Test ${{ matrix.os }} with ${{ matrix.variant }}
+    name: ${{ matrix.os }} with ${{ matrix.variant }} certificate
     runs-on: windows-latest
     needs: [build, matrix]
     if: success()
@@ -163,88 +160,36 @@ jobs:
             if ('${{ github.run_id }}' -ne "`$`{{ github.run_id }}") {$ResourceGroupName += '-${{ github.run_id }}'}
 
             if (-not (Get-AzResourceGroup -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue)) {
-              $null = New-AzResourceGroup -ResourceGroupName $ResourceGroupName -Location $Location -Force
+              $null = New-AzResourceGroup -ResourceGroupName $ResourceGroupName -Location $Location -Force -Tag @{
+                CreatedBy = '${{ github.triggering_actor }}'
+                Ref = '${{ github.ref }}'
+                Until = (Get-Date (Get-Date).AddHours(1) -F 'yyyy/MM/dd')
+                Commit = '${{ github.sha }}'
+              }
             }
 
-            $VM = New-TestVM -ResourceGroupName $ResourceGroupName -Image '${{ matrix.os }}' -Size '${{ inputs.vm_size }}'
+            $VMArgs = @{
+              Image = '${{ matrix.os }}'
+              Size = [string]::IsNullOrEmpty('${{ inputs.vm_size }}') ? 'Standard_B4as_v2' : '${{ inputs.vm_size }}'
+            }
+            $VM = New-TestVM -ResourceGroupName $ResourceGroupName @VMArgs
 
             # Set NSG to have access
             Request-WinRmAccessForTesting -ResourceGroupName $ResourceGroupName -VmName $VM.Name
 
-            Write-Host "Creating remoting session for $($VM.Credential.UserName)@$($Vm.FullyQualifiedDomainName)"
-            $RemotingArgs = @{
-              ComputerName = $VM.FullyQualifiedDomainName
-              Credential = $VM.Credential
-              UseSSL = $true
-              SessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck
-            }
-            $Session = New-PSSession @RemotingArgs
+            $Session = New-HoplessRemotingSession -ComputerName $Vm.FullyQualifiedDomainName -Credential $Vm.Credential
 
-            # This throws an error when the session terminates, so we catch the PSRemotingTransportException 
-            try {
-              $HoplessSession = Invoke-Command -Session $Session {
-                Register-PSSessionConfiguration -Name "Hopless" -RunAsCredential $using:VM.Credential -Force
-              } -ErrorAction Stop
-            } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {}
-
-            Start-Sleep -Seconds 30  # Hate this, but just testing the idea out.
-
-            Write-Verbose "Recreating Session after WinRM restart..."
-            $Timeout = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($Session.Availability -ne 'Available' -and $Timeout.Elapsed.TotalSeconds -lt 180) {
-              try {
-                $Session = New-PSSession @RemotingArgs -ConfigurationName 'Hopless'
-              } catch {
-                Start-Sleep -Seconds 5
-              }
-            }
-
-            if ($Session.Availability -ne 'Available') {
-              $Session
-              Write-Error "Failed to re-establish a connection to '$($Vm.FullyQualifiedDomainName)'"
-            } else {
-              Write-Host "Successfully reconnected after '$($Timeout.Elapsed.TotalSeconds)' seconds" 
-            }
-
-            # Install Dotnet 4.8 if required
-            $RequiresDotnet = Invoke-Command -Session $Session -ScriptBlock {
-              (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Release -lt 528040
-            }
-
-            if ($RequiresDotnet) {
-              Write-Host "Installing Dotnet 4.8 to '$($Vm.FullyQualifiedDomainName)'"
-              $DotnetInstall = Invoke-Command -Session $Session -ScriptBlock {
-                $NetFx48Url = 'https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-x86-x64-allos-enu.exe'
-                $NetFx48Path = $env:TEMP
-                $NetFx48InstallerFile = 'ndp48-x86-x64-allos-enu.exe'
-                $NetFx48Installer = Join-Path $NetFx48Path $NetFx48InstallerFile
-                if (!(Test-Path $NetFx48Installer)) {
-                  Write-Host "Downloading `'$NetFx48Url`' to `'$NetFx48Installer`'"
-                  (New-Object Net.WebClient).DownloadFile("$NetFx48Url","$NetFx48Installer")
-                }
-
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.WorkingDirectory = "$NetFx48Path"
-                $psi.FileName = "$NetFx48InstallerFile"
-                $psi.Arguments = "/q /norestart"
-
-                Write-Host "Installing `'$NetFx48Installer`'"
-                $s = [System.Diagnostics.Process]::Start($psi);
-                $s.WaitForExit();
-
-                return $s.ExitCode
+            # Windows Server 2019 may require Dotnet 4.8 to be installed, and have a reboot
+            $DotnetInstall = Install-Dotnet -Session $Session
+            if ($DotnetInstall -eq 1641 -or $DotnetInstall -eq 3010) {
+              Write-Host ".NET Framework 4.8 was installed, but a reboot is required before using Chocolatey CLI."
+              $Reboot = Restart-AzVm -ResourceGroupName $ResourceGroupName -Name $VM.Name
+              if ($Reboot.Status -eq 'Succeeded') {
+                Write-Host "Reboot was successful after $($Reboot.Endtime - $Reboot.Starttime)"
               }
 
-              if ($DotnetInstall -eq 1641 -or $DotnetInstall -eq 3010) {
-                Write-Host ".NET Framework 4.8 was installed, but a reboot is required before using Chocolatey CLI."
-                $Reboot = Restart-AzVm -ResourceGroupName $ResourceGroupName -Name $VM.Name
-                if ($Reboot.Status -eq 'Succeeded') {
-                  Write-Host "Reboot was successful after $($Reboot.Endtime - $Reboot.Starttime)"
-                }
-
-                # Recreate the session
-                $Session = New-PSSession @RemotingArgs -ConfigurationName 'Hopless'
-              }
+              # Recreate the session
+              $Session = New-HoplessRemotingSession -ComputerName $Vm.FullyQualifiedDomainName -Credential $Vm.Credential
             }
 
             try {
@@ -279,41 +224,54 @@ jobs:
 
             Write-Host "Setting up '${{ matrix.variant }}' Certificate"
             $Certificate = switch ('${{ matrix.variant }}') {
-              'selfsigned' {
-                Write-Host "Creating a Self-Signed Certificate for '$($Vm.FullyQualifiedDomainName)'"
-                @{Hostname = $Vm.FullyQualifiedDomainName}
+              'self-signed' {
+                Write-Host "Creating a Self-Signed Certificate for '$($Vm.Name)'"
+                $CertDetails = @{FQDN = $Vm.Name}
+                @{Hostname = $CertDetails.FQDN}
               }
               'single' {
-                $Thumbprint = Invoke-Command -Session $Session -ScriptBlock {
+                $CertDetails = Invoke-Command -Session $Session -ScriptBlock {
                   $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
                     [Convert]::FromBase64String('${{ secrets.SINGLE_CERT }}'),
-                    (ConvertTo-SecureString '${{ secrets.SINGLE_PASS }}' -AsPlainText -Force)
+                    (ConvertTo-SecureString '${{ secrets.SINGLE_PASS }}' -AsPlainText -Force),
+                    ("Exportable", "PersistKeySet", "MachineKeySet")
                   )
 
-                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("My", "LocalMachine")
+                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("TrustedPeople", "LocalMachine")
                   $Store.Open("ReadWrite")
-                  $Store.Add($Cert)
+                  $null = $Store.Add($Cert)
 
-                  $Cert.Thumbprint
+                  Add-Content $env:windir\system32\drivers\etc\hosts -Value "127.0.0.1 $($Cert.Subject -replace '^CN=')"
+
+                  @{
+                    Thumbprint = $Cert.Thumbprint
+                    FQDN = $Cert.Subject -replace '^CN='
+                  }
                 }
                 Write-Host "Using Certificate with Thumbprint '$($Thumbprint)'"
-                @{Thumbprint = $Thumbprint; Hardened = $true}
+                @{Thumbprint = $CertDetails.Thumbprint; Hardened = $true}
               }
               'wildcard' {
-                $Thumbprint = Invoke-Command -Session $Session -ScriptBlock {
+                $CertDetails = Invoke-Command -Session $Session -ScriptBlock {
                   $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
                     [Convert]::FromBase64String('${{ secrets.WILDCARD_CERT }}'),
-                    (ConvertTo-SecureString '${{ secrets.WILDCARD_PASS }}' -AsPlainText -Force)
+                    (ConvertTo-SecureString '${{ secrets.WILDCARD_PASS }}' -AsPlainText -Force),
+                    ("Exportable", "PersistKeySet", "MachineKeySet")
                   )
 
-                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("My", "LocalMachine")
+                  $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new("TrustedPeople", "LocalMachine")
                   $Store.Open("ReadWrite")
-                  $Store.Add($Cert)
+                  $null = $Store.Add($Cert)
 
-                  $Cert.Thumbprint
+                  Add-Content $env:windir\system32\drivers\etc\hosts -Value "127.0.0.1 $($Cert.Subject -replace '^CN=\*',$env:ComputerName)"
+
+                  @{
+                    Thumbprint = $Cert.Thumbprint
+                    FQDN = $Cert.Subject -replace '^CN=\*',$env:ComputerName
+                  }
                 }
                 Write-Host "Using Wildcard with Thumbprint '$($Thumbprint)'"
-                @{Thumbprint = $Thumbprint; CertificateDnsName = $Vm.FullyQualifiedDomainName; Hardened = $true}
+                @{Thumbprint = $CertDetails.Thumbprint; CertificateDnsName = $CertDetails.FQDN; Hardened = $true}
               }
             }
 
@@ -336,6 +294,12 @@ jobs:
 
               # Run Tests
               Write-Host "Running Verification Tests on '$($VM.Name)'"
+              $RemotingArgs = @{
+                ComputerName = $VM.FullyQualifiedDomainName
+                Credential = $VM.Credential
+                UseSSL = $true
+                SessionOption = New-PSSessionOption -SkipCACheck -SkipCNCheck
+              }
               $TestResults = Invoke-Command -Session $Session -ScriptBlock {
                 if (-not (Get-Module Pester -ListAvailable).Where{$_.Version -gt "5.0"}) {
                   Write-Host "Installing Pester 5 to run validation tests"
@@ -351,7 +315,7 @@ jobs:
                   . C:\choco-setup\files\scripts\Get-Helpers.ps1
                   $configuration = New-PesterConfiguration @{
                     Run        = @{
-                      Container = New-PesterContainer -Path $Path -Data @{ Fqdn = $env:ComputerName }
+                      Container = New-PesterContainer -Path $Path -Data @{ Fqdn = $using:CertDetails.FQDN }
                       Passthru  = $true
                     }
                     Output     = @{
@@ -360,7 +324,7 @@ jobs:
                     TestResult = @{
                       Enabled      = $true
                       OutputFormat = 'NUnitXml'
-                      OutputPath   = "C:\choco-setup\test-results\$((Split-Path $Path -Leaf) -replace '.tests.ps1$')-verification.results.xml"
+                      OutputPath   = "C:\choco-setup\test-results\${{ matrix.os }}-${{ matrix.variant }}-$((Split-Path $Path -Leaf) -replace '.tests.ps1$')-verification.results.xml"
                     }
                   }
 
@@ -380,6 +344,7 @@ jobs:
         if: success()
         with:
           check_name: C4bVerification-${{ matrix.os }}-${{ matrix.variant }}
+          comment_mode: failures
           files: |
             logs\*-verification.results.xml
           github_token: ${{ secrets.GITHUB_TOKEN }}
